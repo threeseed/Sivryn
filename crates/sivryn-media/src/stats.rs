@@ -73,10 +73,8 @@ pub fn summarize(
                         stats.available_send_kbps = Some(p.candidate_pair.available_outgoing_bitrate / 1000.0);
                     }
                 }
-                RtcStats::Codec(c) if !c.codec.mime_type.is_empty() => {
-                    if !stats.codecs.contains(&c.codec.mime_type) {
-                        stats.codecs.push(c.codec.mime_type.clone());
-                    }
+                RtcStats::Codec(c) if !c.codec.mime_type.is_empty() && !stats.codecs.contains(&c.codec.mime_type) => {
+                    stats.codecs.push(c.codec.mime_type.clone());
                 }
                 _ => {}
             }

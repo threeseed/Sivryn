@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn dark_frames_get_brighter_up_to_a_limit() {
         let g = gamma_for(40.0);
-        assert!(g < 1.0 && g >= MIN_GAMMA);
+        assert!((MIN_GAMMA..1.0).contains(&g));
         assert!(gamma_for(5.0) == MIN_GAMMA);
         let mut y = vec![40u8; 64 * 64];
         LowLight::default().apply(&mut y, 64, 64, 64);

@@ -509,11 +509,11 @@ fn on_call_event(mut state: AppState, channel: ChannelId, event: CallEvent) -> O
                     toggle_camera(state);
                     state.toast(t("call.camera_by_mod"), false);
                 }
-                TrackSource::Screenshare | TrackSource::ScreenshareAudio => {
-                    if state.call.peek().as_ref().is_some_and(|c| c.sharing) {
-                        stop_share(state);
-                        state.toast(t("call.share_by_mod"), false);
-                    }
+                TrackSource::Screenshare | TrackSource::ScreenshareAudio
+                    if state.call.peek().as_ref().is_some_and(|c| c.sharing) =>
+                {
+                    stop_share(state);
+                    state.toast(t("call.share_by_mod"), false);
                 }
                 _ => {}
             }
