@@ -345,6 +345,12 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Hellt das Kamerabild in dunklen Räumen auf.",
         "Brightens the camera picture in dark rooms.",
     ),
+    ("video.blur", "Hintergrund weichzeichnen", "Blur background"),
+    (
+        "video.blur_hint",
+        "Erkennt dich auf dem Gerät und zeichnet alles dahinter weich. Kostet etwas Rechenleistung.",
+        "Finds you on this device and blurs everything behind you. Uses some processing power.",
+    ),
     ("video.mirror_self", "Eigenes Bild spiegeln", "Mirror my camera"),
     (
         "video.mirror_self_hint",

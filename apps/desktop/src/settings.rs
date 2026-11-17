@@ -102,6 +102,8 @@ pub struct VideoSettings {
     pub share_windows_tab: bool,
     /// Brighten the camera picture in dark rooms.
     pub low_light: bool,
+    /// Blur what is behind you.
+    pub background_blur: bool,
     /// Show your own camera flipped, like a mirror (others see it unflipped).
     pub mirror_self: bool,
     /// Leave your own tile out of the call grid.
@@ -122,6 +124,13 @@ pub enum CallLayout {
     Speaker,
 }
 
+impl VideoSettings {
+    /// The camera effects these settings ask for.
+    pub fn effects(&self) -> sivryn_media::Effects {
+        sivryn_media::Effects { low_light: self.low_light, background_blur: self.background_blur }
+    }
+}
+
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
@@ -133,6 +142,7 @@ impl Default for VideoSettings {
             screen_audio: true,
             share_windows_tab: false,
             low_light: false,
+            background_blur: false,
             mirror_self: true,
             hide_self: false,
             data_saver: false,

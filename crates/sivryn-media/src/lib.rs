@@ -19,13 +19,14 @@ mod hdr_capture;
 pub mod player;
 pub mod screen;
 pub mod screen_audio;
+pub mod segment;
 pub mod stats;
 pub mod thumbnails;
 pub mod video;
 
 pub use audio::{AudioConfig, AudioDevice, AudioEngine, NoiseSuppression, Sound, VoiceMode};
 pub use call::{CallEvent, DEAFENED_ATTRIBUTE, VoiceCall, screen_volume_key};
-pub use camera::{CameraDevice, CameraPreview, CameraQuality, CameraShare, list_cameras};
+pub use camera::{CameraDevice, CameraPreview, CameraQuality, CameraShare, Effects, list_cameras};
 pub use livekit::prelude::{ConnectionQuality, TrackSource};
 pub use livekit::track::VideoQuality;
 pub use player::{MediaPlayer, video_poster};

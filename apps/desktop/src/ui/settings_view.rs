@@ -586,7 +586,13 @@ fn VideoPage() -> Element {
             label: t("video.low_light").to_string(),
             hint: t("video.low_light_hint").to_string(),
             on: video.low_light,
-            onchange: move |v| super::call::set_low_light(state, v),
+            onchange: move |v| super::call::set_effects(state, |s| s.low_light = v),
+        }
+        ToggleRow {
+            label: t("video.blur").to_string(),
+            hint: t("video.blur_hint").to_string(),
+            on: video.background_blur,
+            onchange: move |v| super::call::set_effects(state, |s| s.background_blur = v),
         }
         ToggleRow {
             label: t("video.mirror_self").to_string(),

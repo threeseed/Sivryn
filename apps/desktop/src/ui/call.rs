@@ -437,7 +437,7 @@ pub fn toggle_camera(mut state: AppState) {
         call.camera_on = true;
     }
     spawn_forever(async move {
-        match CameraShare::start(room, video.camera.as_deref(), video.camera_quality, &limits, video.low_light).await {
+        match CameraShare::start(room, video.camera.as_deref(), video.camera_quality, &limits, video.effects()).await {
             Ok(camera) => {
                 let preview = camera.preview.clone();
                 *c.camera.borrow_mut() = Some(camera);
@@ -660,13 +660,14 @@ pub fn mute_all(state: AppState) {
     });
 }
 
-/// Turns the low-light boost on or off (also on a running camera).
-pub fn set_low_light(state: AppState, on: bool) {
-    state.update_settings(|s| s.video.low_light = on);
+/// Changes the camera effects (also on a running camera).
+pub fn set_effects(state: AppState, change: impl FnOnce(&mut crate::settings::VideoSettings)) {
+    state.update_settings(|s| change(&mut s.video));
+    let effects = state.settings.peek().video.effects();
     if let Some(c) = state.call.peek().as_ref()
         && let Some(camera) = c.camera.borrow().as_ref()
     {
-        camera.set_low_light(on);
+        camera.set_effects(effects);
     }
 }
 
@@ -1597,7 +1598,7 @@ pub fn PreJoinDialog(channel: ChannelId) -> Element {
         }
         let video = state.settings.peek().video.clone();
         spawn(async move {
-            match CameraPreview::start(video.camera.as_deref(), video.camera_quality, video.low_light).await {
+            match CameraPreview::start(video.camera.as_deref(), video.camera_quality, video.effects()).await {
                 Ok(p) => {
                     camera_error.set(None);
                     if *camera_wanted.peek() {
@@ -1636,7 +1637,7 @@ pub fn PreJoinDialog(channel: ChannelId) -> Element {
     let percent = ((*level.read() + 60.0) / 60.0 * 100.0).clamp(0.0, 100.0);
     let name = state.channel_name(channel);
     let feed = preview.read().as_ref().map(|p| p.preview.clone());
-    let low_light = video.low_light;
+    let (low_light, blur) = (video.low_light, video.background_blur);
 
     let join = move |_| {
         let camera = *camera_wanted.peek();
@@ -1682,10 +1683,15 @@ pub fn PreJoinDialog(channel: ChannelId) -> Element {
                     Toggle { on: !*join_muted.read(), onchange: move |v: bool| join_muted.set(!v) }
                     span { {t("call.preview_mic")} }
                     Toggle { on: low_light, onchange: move |v: bool| {
-                        set_low_light(state, v);
-                        if let Some(p) = preview.peek().as_ref() { p.set_low_light(v); }
+                        set_effects(state, |s| s.low_light = v);
+                        if let Some(p) = preview.peek().as_ref() { p.set_effects(state.settings.peek().video.effects()); }
                     } }
                     span { {t("video.low_light")} }
+                    Toggle { on: blur, onchange: move |v: bool| {
+                        set_effects(state, |s| s.background_blur = v);
+                        if let Some(p) = preview.peek().as_ref() { p.set_effects(state.settings.peek().video.effects()); }
+                    } }
+                    span { {t("video.blur")} }
                 }
                 div { class: "dialog-actions",
                     button { class: "button ghost", onclick: move |_| state.modal.set(None), {t("common.cancel")} }

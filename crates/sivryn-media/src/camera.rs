@@ -83,13 +83,38 @@ impl CameraQuality {
     }
 }
 
+/// Camera effects, switchable while the camera runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Effects {
+    pub low_light: bool,
+    pub background_blur: bool,
+}
+
+/// Effect switches shared with the capture thread.
+#[derive(Clone, Default)]
+struct EffectFlags {
+    low_light: Arc<AtomicBool>,
+    blur: Arc<AtomicBool>,
+}
+
+impl EffectFlags {
+    fn new(e: Effects) -> Self {
+        Self { low_light: Arc::new(AtomicBool::new(e.low_light)), blur: Arc::new(AtomicBool::new(e.background_blur)) }
+    }
+
+    fn set(&self, e: Effects) {
+        self.low_light.store(e.low_light, Ordering::Relaxed);
+        self.blur.store(e.background_blur, Ordering::Relaxed);
+    }
+}
+
 /// A published camera. Dropping it stops capture.
 pub struct CameraShare {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     room: Arc<Room>,
     track_sid: livekit::id::TrackSid,
-    low_light: Arc<AtomicBool>,
+    effects: EffectFlags,
     /// Local preview frames (RGBA), like a remote feed.
     pub preview: crate::VideoFeed,
 }
@@ -100,7 +125,7 @@ impl CameraShare {
         camera_name: Option<&str>,
         quality: CameraQuality,
         limits: &CameraLimits,
-        low_light: bool,
+        effects: Effects,
     ) -> Result<Self, MediaError> {
         if !crate::media_foundation_available() {
             return Err(MediaError::NoMediaFoundation);
@@ -117,16 +142,10 @@ impl CameraShare {
         let video_source = NativeVideoSource::new(VideoResolution { width: w, height: h }, false);
         let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
         let stop = Arc::new(AtomicBool::new(false));
-        let low_light = Arc::new(AtomicBool::new(low_light));
-        let thread = spawn_capture(
-            camera.clone(),
-            (w, h, fps),
-            video_source.clone(),
-            preview_tx,
-            stop.clone(),
-            low_light.clone(),
-        )
-        .await?;
+        let effects = EffectFlags::new(effects);
+        let thread =
+            spawn_capture(camera.clone(), (w, h, fps), video_source.clone(), preview_tx, stop.clone(), effects.clone())
+                .await?;
 
         // Hardware H.264 keeps CPU use low; simulcast gives viewers 3 layers.
         let hw = HardwareEncoders::detect();
@@ -162,12 +181,12 @@ impl CameraShare {
             frames: preview_rx,
         };
         tracing::info!(camera = %camera.name, w, h, fps, ?codec, "camera published");
-        Ok(Self { stop, thread: Some(thread), room, track_sid: publication.sid(), low_light, preview })
+        Ok(Self { stop, thread: Some(thread), room, track_sid: publication.sid(), effects, preview })
     }
 
-    /// Turns the low-light boost on or off while the camera runs.
-    pub fn set_low_light(&self, on: bool) {
-        self.low_light.store(on, Ordering::Relaxed);
+    /// Changes the effects while the camera runs.
+    pub fn set_effects(&self, effects: Effects) {
+        self.effects.set(effects);
     }
 
     pub async fn stop(mut self) {
@@ -196,12 +215,16 @@ impl Drop for CameraShare {
 pub struct CameraPreview {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    low_light: Arc<AtomicBool>,
+    effects: EffectFlags,
     pub preview: crate::VideoFeed,
 }
 
 impl CameraPreview {
-    pub async fn start(camera_name: Option<&str>, quality: CameraQuality, low_light: bool) -> Result<Self, MediaError> {
+    pub async fn start(
+        camera_name: Option<&str>,
+        quality: CameraQuality,
+        effects: Effects,
+    ) -> Result<Self, MediaError> {
         if !crate::media_foundation_available() {
             return Err(MediaError::NoMediaFoundation);
         }
@@ -216,19 +239,19 @@ impl CameraPreview {
         let source = NativeVideoSource::new(VideoResolution { width: w, height: h }, false);
         let (tx, frames) = tokio::sync::watch::channel(None);
         let stop = Arc::new(AtomicBool::new(false));
-        let low_light = Arc::new(AtomicBool::new(low_light));
-        let thread = spawn_capture(camera, (w, h, fps), source, tx, stop.clone(), low_light.clone()).await?;
+        let effects = EffectFlags::new(effects);
+        let thread = spawn_capture(camera, (w, h, fps), source, tx, stop.clone(), effects.clone()).await?;
         let preview = crate::VideoFeed {
             participant: String::new(),
             source: TrackSource::Camera,
             track_sid: "camera-preview".into(),
             frames,
         };
-        Ok(Self { stop, thread: Some(thread), low_light, preview })
+        Ok(Self { stop, thread: Some(thread), effects, preview })
     }
 
-    pub fn set_low_light(&self, on: bool) {
-        self.low_light.store(on, Ordering::Relaxed);
+    pub fn set_effects(&self, effects: Effects) {
+        self.effects.set(effects);
     }
 }
 
@@ -274,7 +297,7 @@ async fn spawn_capture(
     video_source: NativeVideoSource,
     preview: tokio::sync::watch::Sender<Option<Arc<crate::RgbaFrame>>>,
     stop: Arc<AtomicBool>,
-    low_light: Arc<AtomicBool>,
+    effects: EffectFlags,
 ) -> Result<JoinHandle<()>, MediaError> {
     // Awaited, not blocked on: callers run on the UI thread.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -302,6 +325,8 @@ async fn spawn_capture(
 
             let started = Instant::now();
             let mut boost = crate::effects::LowLight::default();
+            // Started on first use: it loads the model and runs a thread.
+            let mut blur: Option<crate::effects::BackgroundBlur> = None;
             let mut last_preview = Instant::now() - std::time::Duration::from_secs(1);
             while !stop.load(Ordering::Relaxed) {
                 let frame = match cam.frame() {
@@ -317,11 +342,24 @@ async fn spawn_capture(
                 else {
                     continue;
                 };
-                if low_light.load(Ordering::Relaxed) {
-                    let (w, h) = (i420.width() as usize, i420.height() as usize);
+                let (w, h) = (i420.width() as usize, i420.height() as usize);
+                if effects.low_light.load(Ordering::Relaxed) {
                     let (sy, _, _) = i420.strides();
                     let (y, _, _) = i420.data_mut();
                     boost.apply(y, sy as usize, w, h);
+                }
+                if effects.blur.load(Ordering::Relaxed) {
+                    use crate::effects::Plane;
+                    let (sy, su, sv) = i420.strides();
+                    let (y, u, v) = i420.data_mut();
+                    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                    blur.get_or_insert_with(crate::effects::BackgroundBlur::new).apply(
+                        Plane { data: y, stride: sy as usize, width: w, height: h },
+                        Plane { data: u, stride: su as usize, width: cw, height: ch },
+                        Plane { data: v, stride: sv as usize, width: cw, height: ch },
+                    );
+                } else {
+                    blur = None;
                 }
                 // The self view at the camera's frame rate (15 fps looked
                 // choppy), at most 720p: it is shown small.
