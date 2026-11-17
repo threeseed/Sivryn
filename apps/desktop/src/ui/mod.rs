@@ -100,6 +100,34 @@ pub struct CallState {
     pub auto_focus: bool,
     /// Hide the small tiles below the focused one.
     pub strip_hidden: bool,
+    /// Who has a hand raised, in the order they raised it.
+    pub hands: Vec<String>,
+    /// Emoji reactions shown over tiles for a few seconds.
+    pub reactions: Vec<CallReaction>,
+    /// The server's view of each participant's connection.
+    pub quality: HashMap<String, sivryn_media::ConnectionQuality>,
+    /// The connection dropped and is being restored.
+    pub reconnecting: bool,
+    /// Whether a moderator lets you speak (stage-style channels).
+    pub can_publish: bool,
+    /// The connection statistics panel.
+    pub stats_open: bool,
+    pub stats: Option<sivryn_media::CallStats>,
+    /// The last person who spoke (the speaker layout keeps them large).
+    pub last_speaker: Option<String>,
+    /// The page of the grid shown when there are more people than fit.
+    pub page: usize,
+    /// What was last asked of the server per video track (see
+    /// `VoiceCall::set_video_wanted`).
+    pub wanted: Rc<RefCell<HashMap<String, Option<sivryn_media::VideoQuality>>>>,
+}
+
+/// A reaction floating over someone's tile.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallReaction {
+    pub id: u64,
+    pub identity: String,
+    pub emoji: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -132,6 +160,8 @@ pub enum Modal {
     Profile(UserId),
     /// "This invite is for another instance: sign out and go there?"
     ForeignInvite,
+    /// Camera and microphone check before joining a call.
+    PreJoin(ChannelId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

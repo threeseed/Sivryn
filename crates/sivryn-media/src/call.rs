@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 use crate::MediaError;
 use crate::audio::{AudioEngine, Sound, dsp};
 use crate::video::{VideoFeed, spawn_feed};
+use livekit::prelude::ConnectionQuality;
+use livekit::track::VideoQuality;
+use sivryn_protocol::call::{CallSignal, SIGNAL_TOPIC};
 
 /// Events the UI cares about during a call.
 pub enum CallEvent {
@@ -44,6 +47,26 @@ pub enum CallEvent {
         identity: String,
         deafened: bool,
     },
+    /// A raise hand, reaction or moderator request from someone in the call.
+    Signal {
+        identity: String,
+        signal: CallSignal,
+    },
+    /// The server's view of someone's connection (including your own).
+    Quality {
+        identity: String,
+        quality: ConnectionQuality,
+    },
+    /// The connection dropped; LiveKit is restarting ICE and resuming.
+    Reconnecting,
+    /// Back after [`CallEvent::Reconnecting`].
+    Reconnected,
+    /// A moderator muted one of your own tracks (microphone, camera, share).
+    LocalMuted {
+        source: TrackSource,
+    },
+    /// A moderator allowed or took away your speaking (and video, sharing).
+    CanPublish(bool),
     Disconnected,
 }
 
@@ -178,6 +201,11 @@ impl VoiceCall {
                         }
                         _ => continue,
                     },
+                    RoomEvent::TrackMuted { participant: Participant::Local(_), publication }
+                        if publication.source() != TrackSource::Microphone =>
+                    {
+                        CallEvent::LocalMuted { source: publication.source() }
+                    }
                     RoomEvent::TrackMuted { participant, publication }
                         if publication.source() == TrackSource::Microphone =>
                     {
@@ -195,6 +223,20 @@ impl VoiceCall {
                             deafened: value == "1",
                         }
                     }
+                    RoomEvent::DataReceived { payload, topic, participant: Some(p), .. }
+                        if topic.as_deref() == Some(SIGNAL_TOPIC) =>
+                    {
+                        let Some(signal) = CallSignal::decode(&payload) else { continue };
+                        CallEvent::Signal { identity: p.identity().to_string(), signal }
+                    }
+                    RoomEvent::ConnectionQualityChanged { quality, participant } => {
+                        CallEvent::Quality { identity: participant.identity().to_string(), quality }
+                    }
+                    RoomEvent::ParticipantPermissionChanged { participant: Participant::Local(_), permission } => {
+                        CallEvent::CanPublish(permission.is_none_or(|p| p.can_publish))
+                    }
+                    RoomEvent::Reconnecting => CallEvent::Reconnecting,
+                    RoomEvent::Reconnected => CallEvent::Reconnected,
                     RoomEvent::Disconnected { .. } => CallEvent::Disconnected,
                     _ => continue,
                 };
@@ -232,6 +274,17 @@ impl VoiceCall {
         Ok(())
     }
 
+    /// Publishes the microphone again after a moderator allowed speaking
+    /// (the server removed it when speaking was taken away).
+    pub async fn restore_microphone(&mut self) -> Result<(), MediaError> {
+        if let Some(track) = self.mic.take() {
+            self.engine.attach_microphone(None);
+            // Usually already gone; failing to unpublish it again is fine.
+            let _ = self.room.local_participant().unpublish_track(&track.sid()).await;
+        }
+        self.enable_microphone().await
+    }
+
     /// Mutes the microphone; others see the muted state.
     pub fn set_muted(&self, muted: bool) {
         self.engine.set_muted(muted);
@@ -251,6 +304,43 @@ impl VoiceCall {
                 tracing::debug!(error = %e, "could not announce deafen state");
             }
         });
+    }
+
+    /// Sends a raise hand, reaction or moderator request to everyone in the
+    /// call (in the background; must be called inside the Tokio runtime).
+    pub fn send_signal(&self, signal: CallSignal) {
+        let room = self.room.clone();
+        tokio::spawn(async move {
+            let packet = DataPacket {
+                payload: signal.encode(),
+                topic: Some(SIGNAL_TOPIC.into()),
+                reliable: true,
+                ..Default::default()
+            };
+            if let Err(e) = room.local_participant().publish_data(packet).await {
+                tracing::debug!(error = %e, "could not send call signal");
+            }
+        });
+    }
+
+    /// Asks the server for a video track only while its tile is visible, and
+    /// only at the layer that fits the tile (`None` pauses it). Saves
+    /// bandwidth and decoding in big calls and in the "audio only" mode.
+    pub fn set_video_wanted(&self, track_sid: &str, quality: Option<VideoQuality>) {
+        for participant in self.room.remote_participants().values() {
+            for publication in participant.track_publications().values() {
+                if publication.sid().as_str() != track_sid {
+                    continue;
+                }
+                publication.set_enabled(quality.is_some());
+                if let Some(q) = quality
+                    && publication.simulcasted()
+                {
+                    publication.set_video_quality(q);
+                }
+                return;
+            }
+        }
     }
 
     pub fn identity(&self) -> String {

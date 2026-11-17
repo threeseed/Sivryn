@@ -270,6 +270,28 @@ impl ApiClient {
     pub async fn join_voice(&self, channel: ChannelId) -> Result<VoiceJoinResponse, ClientError> {
         self.post(&format!("/channels/{channel}/voice/join"), &()).await
     }
+
+    /// Mutes, stops the camera or share of, or lets speak / silences someone
+    /// in a guild call (needs `MUTE_MEMBERS`).
+    pub async fn moderate_voice(
+        &self,
+        channel: ChannelId,
+        user: UserId,
+        action: sivryn_protocol::call::ModerateAction,
+    ) -> Result<(), ClientError> {
+        self.post(
+            &format!("/channels/{channel}/voice/{user}/moderate"),
+            &sivryn_protocol::call::ModerateRequest { action },
+        )
+        .await
+    }
+
+    /// Mutes everyone else in a guild call; returns how many were muted.
+    pub async fn mute_all_voice(&self, channel: ChannelId) -> Result<u32, ClientError> {
+        let r: sivryn_protocol::call::MuteAllResponse =
+            self.post(&format!("/channels/{channel}/voice/mute-all"), &()).await?;
+        Ok(r.muted)
+    }
 }
 
 /// Social features, moderation and files.

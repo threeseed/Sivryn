@@ -411,6 +411,7 @@ fn ModalView() -> Element {
         Some(Modal::JoinVoice(channel)) => rsx! { call::JoinVoiceDialog { channel } },
         Some(Modal::NotifySettings(guild)) => rsx! { channels::NotifyDialog { guild } },
         Some(Modal::ForeignInvite) => rsx! { super::invites::ForeignInviteDialog {} },
+        Some(Modal::PreJoin(channel)) => rsx! { super::call::PreJoinDialog { channel } },
         Some(modal) => rsx! { GuildDialog { key: "{modal:?}", modal } },
         None => rsx! {},
     }

@@ -134,6 +134,8 @@ struct Inner {
     deafened: AtomicBool,
     push_to_talk: AtomicBool,
     mic_test: AtomicBool,
+    /// Capture the microphone only for the level meter (no playback).
+    mic_meter: AtomicBool,
     in_call: AtomicBool,
     /// Processed microphone level in dBFS (f32 bits), for meters.
     level: AtomicU32,
@@ -159,7 +161,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Inner {
     fn capture_wanted(&self) -> bool {
-        lock(&self.mic).is_some() || self.mic_test.load(Ordering::Relaxed)
+        lock(&self.mic).is_some() || self.mic_test.load(Ordering::Relaxed) || self.mic_meter.load(Ordering::Relaxed)
     }
 
     fn playout_wanted(&self) -> bool {
@@ -187,6 +189,7 @@ impl AudioEngine {
                 deafened: AtomicBool::new(false),
                 push_to_talk: AtomicBool::new(false),
                 mic_test: AtomicBool::new(false),
+                mic_meter: AtomicBool::new(false),
                 in_call: AtomicBool::new(false),
                 level: AtomicU32::new((-100.0f32).to_bits()),
                 transmitting: AtomicBool::new(false),
@@ -261,6 +264,13 @@ impl AudioEngine {
         if !on {
             lock(&self.inner.monitor).clear();
         }
+        self.ensure_threads();
+    }
+
+    /// Runs the microphone for [`Self::level_db`] only, without playing it
+    /// back (the check before joining a call).
+    pub fn set_mic_meter(&self, on: bool) {
+        self.inner.mic_meter.store(on, Ordering::Relaxed);
         self.ensure_threads();
     }
 

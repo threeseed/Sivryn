@@ -14,20 +14,24 @@ pub mod call;
 pub mod camera;
 pub mod codec;
 mod cursor;
+pub mod effects;
 mod hdr_capture;
 pub mod player;
 pub mod screen;
 pub mod screen_audio;
+pub mod stats;
 pub mod thumbnails;
 pub mod video;
 
 pub use audio::{AudioConfig, AudioDevice, AudioEngine, NoiseSuppression, Sound, VoiceMode};
 pub use call::{CallEvent, DEAFENED_ATTRIBUTE, VoiceCall, screen_volume_key};
-pub use camera::{CameraDevice, CameraQuality, CameraShare, list_cameras};
-pub use livekit::prelude::TrackSource;
+pub use camera::{CameraDevice, CameraPreview, CameraQuality, CameraShare, list_cameras};
+pub use livekit::prelude::{ConnectionQuality, TrackSource};
+pub use livekit::track::VideoQuality;
 pub use player::{MediaPlayer, video_poster};
 pub use screen::{ScreenShare, ScreenSource, SourceKind, list_sources};
 pub use screen_audio::{LoopbackTarget, ScreenAudio, window_process};
+pub use stats::{CallStats, Totals};
 pub use thumbnails::{SourcePreviews, Thumbnail};
 pub use video::{RgbaFrame, VideoFeed};
 

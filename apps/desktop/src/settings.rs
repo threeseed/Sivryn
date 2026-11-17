@@ -100,6 +100,26 @@ pub struct VideoSettings {
     pub screen_audio: bool,
     /// The share picker's last tab: windows (`true`) or screens.
     pub share_windows_tab: bool,
+    /// Brighten the camera picture in dark rooms.
+    pub low_light: bool,
+    /// Show your own camera flipped, like a mirror (others see it unflipped).
+    pub mirror_self: bool,
+    /// Leave your own tile out of the call grid.
+    pub hide_self: bool,
+    /// Audio only: don't receive cameras, and screen shares at low quality.
+    pub data_saver: bool,
+    /// How the call stage arranges people.
+    pub call_layout: CallLayout,
+}
+
+/// How the call stage arranges people.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallLayout {
+    /// Everyone the same size.
+    #[default]
+    Grid,
+    /// Whoever speaks is shown large.
+    Speaker,
 }
 
 impl Default for VideoSettings {
@@ -112,6 +132,11 @@ impl Default for VideoSettings {
             screen_hint: ContentHint::Detail,
             screen_audio: true,
             share_windows_tab: false,
+            low_light: false,
+            mirror_self: true,
+            hide_self: false,
+            data_saver: false,
+            call_layout: CallLayout::Grid,
         }
     }
 }

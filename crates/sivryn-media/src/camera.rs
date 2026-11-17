@@ -89,6 +89,7 @@ pub struct CameraShare {
     thread: Option<JoinHandle<()>>,
     room: Arc<Room>,
     track_sid: livekit::id::TrackSid,
+    low_light: Arc<AtomicBool>,
     /// Local preview frames (RGBA), like a remote feed.
     pub preview: crate::VideoFeed,
 }
@@ -99,6 +100,7 @@ impl CameraShare {
         camera_name: Option<&str>,
         quality: CameraQuality,
         limits: &CameraLimits,
+        low_light: bool,
     ) -> Result<Self, MediaError> {
         if !crate::media_foundation_available() {
             return Err(MediaError::NoMediaFoundation);
@@ -115,7 +117,16 @@ impl CameraShare {
         let video_source = NativeVideoSource::new(VideoResolution { width: w, height: h }, false);
         let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
         let stop = Arc::new(AtomicBool::new(false));
-        let thread = spawn_capture(camera.clone(), (w, h, fps), video_source.clone(), preview_tx, stop.clone()).await?;
+        let low_light = Arc::new(AtomicBool::new(low_light));
+        let thread = spawn_capture(
+            camera.clone(),
+            (w, h, fps),
+            video_source.clone(),
+            preview_tx,
+            stop.clone(),
+            low_light.clone(),
+        )
+        .await?;
 
         // Hardware H.264 keeps CPU use low; simulcast gives viewers 3 layers.
         let hw = HardwareEncoders::detect();
@@ -151,7 +162,12 @@ impl CameraShare {
             frames: preview_rx,
         };
         tracing::info!(camera = %camera.name, w, h, fps, ?codec, "camera published");
-        Ok(Self { stop, thread: Some(thread), room, track_sid: publication.sid(), preview })
+        Ok(Self { stop, thread: Some(thread), room, track_sid: publication.sid(), low_light, preview })
+    }
+
+    /// Turns the low-light boost on or off while the camera runs.
+    pub fn set_low_light(&self, on: bool) {
+        self.low_light.store(on, Ordering::Relaxed);
     }
 
     pub async fn stop(mut self) {
@@ -172,6 +188,56 @@ impl CameraShare {
 impl Drop for CameraShare {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// The camera shown only to yourself, before joining a call. Nothing is
+/// published; dropping it stops the camera.
+pub struct CameraPreview {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    low_light: Arc<AtomicBool>,
+    pub preview: crate::VideoFeed,
+}
+
+impl CameraPreview {
+    pub async fn start(camera_name: Option<&str>, quality: CameraQuality, low_light: bool) -> Result<Self, MediaError> {
+        if !crate::media_foundation_available() {
+            return Err(MediaError::NoMediaFoundation);
+        }
+        let cameras = list_cameras();
+        let camera = camera_name
+            .and_then(|name| cameras.iter().find(|c| c.name == name))
+            .or_else(|| cameras.first())
+            .cloned()
+            .ok_or(MediaError::NoCamera)?;
+        let (w, h, fps) = quality.size();
+        // Nothing reads this source; capture still needs one to feed.
+        let source = NativeVideoSource::new(VideoResolution { width: w, height: h }, false);
+        let (tx, frames) = tokio::sync::watch::channel(None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let low_light = Arc::new(AtomicBool::new(low_light));
+        let thread = spawn_capture(camera, (w, h, fps), source, tx, stop.clone(), low_light.clone()).await?;
+        let preview = crate::VideoFeed {
+            participant: String::new(),
+            source: TrackSource::Camera,
+            track_sid: "camera-preview".into(),
+            frames,
+        };
+        Ok(Self { stop, thread: Some(thread), low_light, preview })
+    }
+
+    pub fn set_low_light(&self, on: bool) {
+        self.low_light.store(on, Ordering::Relaxed);
+    }
+}
+
+impl Drop for CameraPreview {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -208,6 +274,7 @@ async fn spawn_capture(
     video_source: NativeVideoSource,
     preview: tokio::sync::watch::Sender<Option<Arc<crate::RgbaFrame>>>,
     stop: Arc<AtomicBool>,
+    low_light: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, MediaError> {
     // Awaited, not blocked on: callers run on the UI thread.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -234,6 +301,7 @@ async fn spawn_capture(
             let _ = ready_tx.send(Ok(()));
 
             let started = Instant::now();
+            let mut boost = crate::effects::LowLight::default();
             let mut last_preview = Instant::now() - std::time::Duration::from_secs(1);
             while !stop.load(Ordering::Relaxed) {
                 let frame = match cam.frame() {
@@ -249,6 +317,12 @@ async fn spawn_capture(
                 else {
                     continue;
                 };
+                if low_light.load(Ordering::Relaxed) {
+                    let (w, h) = (i420.width() as usize, i420.height() as usize);
+                    let (sy, _, _) = i420.strides();
+                    let (y, _, _) = i420.data_mut();
+                    boost.apply(y, sy as usize, w, h);
+                }
                 // The self view at the camera's frame rate (15 fps looked
                 // choppy), at most 720p: it is shown small.
                 if last_preview.elapsed() >= PREVIEW_INTERVAL && preview.receiver_count() > 0 {

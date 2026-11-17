@@ -13,7 +13,7 @@ use super::widgets::{Avatar, IconButton, RemoteImage, Segmented, Select, Slider,
 use super::{AppState, CapturedKey, Services, SettingsPage};
 use crate::hotkeys::Keybind;
 use crate::i18n::t;
-use crate::settings::{Keybinds, Language, SCREEN_FPS, ScreenResolution, Theme};
+use crate::settings::{CallLayout, Keybinds, Language, SCREEN_FPS, ScreenResolution, Theme};
 use sivryn_client_core::protocol::GuildId;
 use sivryn_client_core::protocol::api::UpdateMeRequest;
 
@@ -580,6 +580,41 @@ fn VideoPage() -> Element {
                     }),
                 }
             }
+        }
+        h2 { class: "subsection", {t("video.effects")} }
+        ToggleRow {
+            label: t("video.low_light").to_string(),
+            hint: t("video.low_light_hint").to_string(),
+            on: video.low_light,
+            onchange: move |v| super::call::set_low_light(state, v),
+        }
+        ToggleRow {
+            label: t("video.mirror_self").to_string(),
+            hint: t("video.mirror_self_hint").to_string(),
+            on: video.mirror_self,
+            onchange: move |v| state.update_settings(|s| s.video.mirror_self = v),
+        }
+        div { class: "divider" }
+        h2 { class: "subsection", {t("video.calls")} }
+        Field { label: t("video.layout").to_string(),
+            Segmented {
+                value: if video.call_layout == CallLayout::Speaker { "speaker".to_string() } else { "grid".to_string() },
+                options: vec![opt("grid", t("video.layout_grid")), opt("speaker", t("video.layout_speaker"))],
+                onchange: move |v: String| state.update_settings(|s| {
+                    s.video.call_layout = if v == "speaker" { CallLayout::Speaker } else { CallLayout::Grid }
+                }),
+            }
+        }
+        ToggleRow {
+            label: t("video.hide_self").to_string(),
+            on: video.hide_self,
+            onchange: move |v| state.update_settings(|s| s.video.hide_self = v),
+        }
+        ToggleRow {
+            label: t("video.data_saver").to_string(),
+            hint: t("video.data_saver_hint").to_string(),
+            on: video.data_saver,
+            onchange: move |v| state.update_settings(|s| s.video.data_saver = v),
         }
         div { class: "divider" }
         h2 { class: "subsection", {t("video.screen")} }

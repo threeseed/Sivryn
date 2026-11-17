@@ -8,19 +8,22 @@ use dioxus_native::prelude::dioxus_core::spawn_forever;
 use dioxus_native::prelude::*;
 use dioxus_native::use_wgpu;
 use sivryn_client_core::protocol::ChannelId;
+use sivryn_client_core::protocol::call::{CallSignal, ModerateAction};
 use sivryn_client_core::protocol::media::{ContentHint, VideoCodec};
+use sivryn_client_core::protocol::permissions::Permissions;
 use sivryn_media::{
-    CallEvent, CameraShare, LoopbackTarget, ScreenAudio, ScreenShare, ScreenSource, Sound, SourceKind, SourcePreviews,
-    TrackSource, VideoFeed, VoiceCall, list_sources, screen_volume_key, window_process,
+    CallEvent, CameraPreview, CameraShare, ConnectionQuality, LoopbackTarget, ScreenAudio, ScreenShare, ScreenSource,
+    Sound, SourceKind, SourcePreviews, TrackSource, VideoFeed, VideoQuality, VoiceCall, list_sources,
+    screen_volume_key, window_process,
 };
 
 use super::icons::{Icon, Svg};
 use super::media::{FrameCanvas, Frames};
 use super::widgets::{Avatar, IconButton, Toggle};
-use super::{AppState, CallState, Focus, Modal, Participant, Services};
+use super::{AppState, CallReaction, CallState, Focus, Modal, Participant, Services};
 use crate::chat;
 use crate::i18n::t;
-use crate::settings::{SCREEN_FPS, ScreenResolution};
+use crate::settings::{CallLayout, SCREEN_FPS, ScreenResolution};
 use crate::video_surface::{SharedView, VideoSurface, View};
 
 /// Joins a voice channel and shows it, after asking when that means leaving
@@ -162,6 +165,17 @@ fn VoiceIdle(channel: ChannelId) -> Element {
                     onclick: move |_| join_channel(state, channel),
                     if connecting { {t("call.connecting")} } else { {t("call.join")} }
                 }
+                if !connecting {
+                    button {
+                        class: "button ghost",
+                        onclick: move |_| {
+                            let mut state = state;
+                            state.modal.set(Some(Modal::PreJoin(channel)));
+                        },
+                        Svg { icon: Icon::Video, size: 16 }
+                        {t("call.preview")}
+                    }
+                }
             }
         }
     }
@@ -229,6 +243,16 @@ async fn connect_inner(
         focus: None,
         auto_focus: true,
         strip_hidden: false,
+        hands: Vec::new(),
+        reactions: Vec::new(),
+        quality: Default::default(),
+        reconnecting: false,
+        can_publish: true,
+        stats_open: false,
+        stats: None,
+        last_speaker: None,
+        page: 0,
+        wanted: Default::default(),
     }));
     spawn_forever(state.refresh_voice());
 
@@ -248,6 +272,11 @@ async fn connect_inner(
                 _ => break,
             };
             if changed && let Some(c) = state.call.write().as_mut() {
+                // The speaker layout keeps the last person who spoke large
+                // (someone else than you, unless you are alone).
+                if let Some(other) = now.iter().find(|p| **p != c.identity) {
+                    c.last_speaker = Some(other.clone());
+                }
                 c.speakers = now;
             }
         }
@@ -261,6 +290,10 @@ async fn connect_inner(
                     Some(identity.parse().ok().map(|id| state.username(id)).unwrap_or_else(|| name.clone()))
                 }
                 _ => None,
+            };
+            let event = match on_call_event(state, channel, event) {
+                Some(e) => e,
+                None => continue,
             };
             let mut call = state.call.write();
             let Some(c) = call.as_mut().filter(|c| c.channel == channel) else { break };
@@ -284,7 +317,18 @@ async fn connect_inner(
                         });
                     }
                 }
-                CallEvent::ParticipantLeft { identity } => c.participants.retain(|p| p.identity != identity),
+                CallEvent::ParticipantLeft { identity } => {
+                    c.hands.retain(|h| *h != identity);
+                    c.quality.remove(&identity);
+                    c.participants.retain(|p| p.identity != identity);
+                }
+                CallEvent::Quality { identity, quality } => {
+                    c.quality.insert(identity, quality);
+                }
+                CallEvent::Reconnecting => c.reconnecting = true,
+                CallEvent::Reconnected => c.reconnecting = false,
+                // Handled in `on_call_event`.
+                CallEvent::Signal { .. } | CallEvent::LocalMuted { .. } | CallEvent::CanPublish(_) => {}
                 CallEvent::MuteChanged { identity, muted } => {
                     if let Some(p) = c.participants.iter_mut().find(|p| p.identity == identity) {
                         p.muted = muted;
@@ -393,7 +437,7 @@ pub fn toggle_camera(mut state: AppState) {
         call.camera_on = true;
     }
     spawn_forever(async move {
-        match CameraShare::start(room, video.camera.as_deref(), video.camera_quality, &limits).await {
+        match CameraShare::start(room, video.camera.as_deref(), video.camera_quality, &limits, video.low_light).await {
             Ok(camera) => {
                 let preview = camera.preview.clone();
                 *c.camera.borrow_mut() = Some(camera);
@@ -416,24 +460,353 @@ pub fn toggle_camera(mut state: AppState) {
     });
 }
 
+/// Handles call events that need more than updating the call state (toasts,
+/// stopping your own camera). Returns the event when the caller should still
+/// apply it to the call state.
+fn on_call_event(mut state: AppState, channel: ChannelId, event: CallEvent) -> Option<CallEvent> {
+    let me = state.call.peek().as_ref().filter(|c| c.channel == channel).map(|c| c.identity.clone())?;
+    let names = state;
+    let name_of = move |identity: &str| -> String {
+        let guild = names.guild_of(channel);
+        identity.parse().ok().map(|id| names.display_name_in(guild, id)).unwrap_or_else(|| identity.to_owned())
+    };
+    match event {
+        CallEvent::Signal { identity, signal } => {
+            match signal {
+                CallSignal::Hand { raised } => {
+                    if let Some(c) = state.call.write().as_mut() {
+                        c.hands.retain(|h| *h != identity);
+                        if raised {
+                            c.hands.push(identity.clone());
+                        }
+                    }
+                    if raised {
+                        state.toast(format!("✋ {} {}", name_of(&identity), t("call.hand_raised")), false);
+                    }
+                }
+                CallSignal::Reaction { emoji } => show_reaction(state, identity, emoji),
+                CallSignal::AskUnmute { target } if target == me => {
+                    // Only someone who may moderate this channel can ask.
+                    state.toast(format!("{} {}", name_of(&identity), t("call.asked_unmute")), false);
+                }
+                CallSignal::AskUnmute { .. } => {}
+            }
+            None
+        }
+        CallEvent::MuteChanged { ref identity, muted: true }
+            if *identity == me && !*state.muted.peek() && !*state.deafened.peek() && !state.is_afk_channel(channel) =>
+        {
+            // Muted by someone else: a moderator.
+            state.muted.set(true);
+            state.apply_mute();
+            state.toast(t("call.muted_by_mod"), false);
+            Some(event)
+        }
+        CallEvent::LocalMuted { source } => {
+            let camera_on = state.call.peek().as_ref().is_some_and(|c| c.camera_on);
+            match source {
+                TrackSource::Camera if camera_on => {
+                    toggle_camera(state);
+                    state.toast(t("call.camera_by_mod"), false);
+                }
+                TrackSource::Screenshare | TrackSource::ScreenshareAudio => {
+                    if state.call.peek().as_ref().is_some_and(|c| c.sharing) {
+                        stop_share(state);
+                        state.toast(t("call.share_by_mod"), false);
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+        CallEvent::CanPublish(allowed) => {
+            let was = state.call.peek().as_ref().is_some_and(|c| c.can_publish);
+            if let Some(c) = state.call.write().as_mut() {
+                c.can_publish = allowed;
+            }
+            if allowed == was {
+                return None;
+            }
+            if allowed {
+                state.toast(t("call.speak_allowed"), false);
+                // The server removed the microphone; publish it again, muted
+                // until the user unmutes.
+                state.muted.set(true);
+                let call = state.call.peek().as_ref().map(|c| c.call.clone());
+                if let Some(call) = call {
+                    spawn_forever(async move {
+                        let vc = call.borrow_mut().take();
+                        if let Some(mut vc) = vc {
+                            if let Err(e) = vc.restore_microphone().await {
+                                tracing::warn!(error = %e, "could not publish the microphone again");
+                            }
+                            *call.borrow_mut() = Some(vc);
+                        }
+                        state.apply_mute();
+                    });
+                }
+            } else {
+                state.toast(t("call.speak_revoked"), false);
+                state.muted.set(true);
+                state.apply_mute();
+                if state.call.peek().as_ref().is_some_and(|c| c.camera_on) {
+                    toggle_camera(state);
+                }
+                if state.call.peek().as_ref().is_some_and(|c| c.sharing) {
+                    stop_share(state);
+                }
+            }
+            None
+        }
+        CallEvent::Reconnected => {
+            state.toast(t("call.reconnected"), false);
+            Some(event)
+        }
+        other => Some(other),
+    }
+}
+
+/// How long a reaction floats over a tile.
+const REACTION_TIME: std::time::Duration = std::time::Duration::from_millis(3500);
+/// Reactions offered in the call controls.
+pub const REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "👏"];
+
+fn show_reaction(mut state: AppState, identity: String, emoji: String) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(c) = state.call.write().as_mut() {
+        // At most three at once per person, so spamming stays readable.
+        let theirs = c.reactions.iter().filter(|r| r.identity == identity).count();
+        if theirs >= 3 {
+            return;
+        }
+        c.reactions.push(CallReaction { id, identity, emoji });
+    }
+    spawn_forever(async move {
+        tokio::time::sleep(REACTION_TIME).await;
+        if let Some(c) = state.call.write().as_mut() {
+            c.reactions.retain(|r| r.id != id);
+        }
+    });
+}
+
+fn send_signal(state: AppState, signal: CallSignal) {
+    let call = state.call.peek().as_ref().map(|c| c.call.clone());
+    if let Some(call) = call
+        && let Some(vc) = call.borrow().as_ref()
+    {
+        vc.send_signal(signal);
+    }
+}
+
+/// Raises or lowers your hand.
+pub fn toggle_hand(mut state: AppState) {
+    let Some(raised) = state.call.write().as_mut().map(|c| {
+        let raised = !c.hands.contains(&c.identity);
+        let me = c.identity.clone();
+        c.hands.retain(|h| *h != me);
+        if raised {
+            c.hands.push(me);
+        }
+        raised
+    }) else {
+        return;
+    };
+    send_signal(state, CallSignal::Hand { raised });
+}
+
+/// Sends an emoji reaction (and shows it on your own tile).
+pub fn react(state: AppState, emoji: &str) {
+    let Some(me) = state.call.peek().as_ref().map(|c| c.identity.clone()) else { return };
+    show_reaction(state, me, emoji.to_owned());
+    send_signal(state, CallSignal::Reaction { emoji: emoji.to_owned() });
+}
+
+/// Asks someone to unmute (a moderator request; never forced).
+pub fn ask_unmute(state: AppState, identity: String) {
+    send_signal(state, CallSignal::AskUnmute { target: identity });
+}
+
+/// Whether you may moderate the call you are in.
+pub fn can_moderate(state: &AppState) -> bool {
+    let Some(channel) = state.call.read().as_ref().map(|c| c.channel) else { return false };
+    state.guild_of(channel).is_some() && state.channel_permissions(channel).allows(Permissions::MUTE_MEMBERS)
+}
+
+/// A moderator action on someone in your call.
+pub fn moderate(
+    state: AppState,
+    channel: ChannelId,
+    user: sivryn_client_core::protocol::UserId,
+    action: ModerateAction,
+) {
+    let Some(s) = state.session.cloned() else { return };
+    spawn_forever(async move {
+        let result = s.api.moderate_voice(channel, user, action).await.map_err(|e| e.to_string());
+        state.report(result);
+    });
+}
+
+/// Mutes everyone else in the call.
+pub fn mute_all(state: AppState) {
+    let (Some(s), Some(channel)) = (state.session.cloned(), state.call.peek().as_ref().map(|c| c.channel)) else {
+        return;
+    };
+    spawn_forever(async move {
+        match s.api.mute_all_voice(channel).await {
+            Ok(n) => state.toast(format!("{} {n}", t("call.muted_all")), false),
+            Err(e) => state.report(Err(e.to_string())),
+        }
+    });
+}
+
+/// Turns the low-light boost on or off (also on a running camera).
+pub fn set_low_light(state: AppState, on: bool) {
+    state.update_settings(|s| s.video.low_light = on);
+    if let Some(c) = state.call.peek().as_ref()
+        && let Some(camera) = c.camera.borrow().as_ref()
+    {
+        camera.set_low_light(on);
+    }
+}
+
+/// Opens or closes the connection panel; while open, it samples the stats
+/// every two seconds.
+pub fn toggle_stats(mut state: AppState) {
+    let Some(open) = state.call.write().as_mut().map(|c| {
+        c.stats_open = !c.stats_open;
+        if !c.stats_open {
+            c.stats = None;
+        }
+        c.stats_open
+    }) else {
+        return;
+    };
+    if !open {
+        return;
+    }
+    spawn_forever(async move {
+        let mut prev = None;
+        loop {
+            let Some((call, true)) = state.call.peek().as_ref().map(|c| (c.call.clone(), c.stats_open)) else { break };
+            // The room is shared; stats don't need the call borrowed across the await.
+            let room = call.borrow().as_ref().map(|vc| vc.room.clone());
+            let Some(room) = room else { break };
+            let sample = sivryn_media::stats::sample(&room, prev).await;
+            if let Some((stats, totals)) = sample {
+                prev = Some((totals, std::time::Instant::now()));
+                if let Some(c) = state.call.write().as_mut()
+                    && c.stats_open
+                {
+                    c.stats = Some(stats);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Which video layer each remote track should be received at: paused when
+/// its tile isn't shown (strip hidden, another page, data saver), small in
+/// the strip or a big grid, full size when shown large.
+pub fn wanted_video(
+    feeds: &[VideoFeed],
+    me: &str,
+    focus: Option<&Focus>,
+    shown: &[String],
+    strip_hidden: bool,
+    data_saver: bool,
+    grid_size: usize,
+) -> Vec<(String, Option<VideoQuality>)> {
+    feeds
+        .iter()
+        .filter(|f| f.participant != me)
+        .map(|f| {
+            let big = match focus {
+                Some(Focus::Screen(sid)) => *sid == f.track_sid,
+                Some(Focus::User(id)) => *id == f.participant && f.source == TrackSource::Camera,
+                None => false,
+            };
+            let visible = shown.contains(&f.participant) || shown.contains(&f.track_sid);
+            let quality = if f.source == TrackSource::Screenshare {
+                // Screens are what people came for: never paused, only
+                // lowered in data saver mode or when small.
+                Some(if data_saver {
+                    VideoQuality::Low
+                } else if big || focus.is_none() {
+                    VideoQuality::High
+                } else {
+                    VideoQuality::Low
+                })
+            } else if data_saver || !visible || (focus.is_some() && !big && strip_hidden) {
+                None
+            } else if big {
+                Some(VideoQuality::High)
+            } else if focus.is_some() || grid_size > 6 {
+                Some(VideoQuality::Low)
+            } else if grid_size > 2 {
+                Some(VideoQuality::Medium)
+            } else {
+                Some(VideoQuality::High)
+            };
+            (f.track_sid.clone(), quality)
+        })
+        .collect()
+}
+
+/// Tells the server about changed wishes from [`wanted_video`].
+fn apply_wanted(c: &CallState, wanted: Vec<(String, Option<VideoQuality>)>) {
+    let mut applied = c.wanted.borrow_mut();
+    let call = c.call.borrow();
+    let Some(vc) = call.as_ref() else { return };
+    for (sid, quality) in wanted {
+        if applied.get(&sid) != Some(&quality) {
+            vc.set_video_wanted(&sid, quality);
+            applied.insert(sid, quality);
+        }
+    }
+    applied.retain(|sid, _| c.feeds.iter().any(|f| &f.track_sid == sid));
+}
+
+/// Most tiles on one page of the grid.
+pub const PAGE_SIZE: usize = 16;
+
+/// The people on one page of the grid (screens are always shown).
+pub fn page_of<T: Clone>(people: &[T], page: usize) -> (Vec<T>, usize) {
+    let pages = people.len().div_ceil(PAGE_SIZE).max(1);
+    let page = page.min(pages - 1);
+    (people.iter().skip(page * PAGE_SIZE).take(PAGE_SIZE).cloned().collect(), pages)
+}
+
 /// The call grid with controls. `compact` is the version above a DM's chat.
 #[component]
 pub fn CallView(#[props(default)] compact: bool) -> Element {
     let mut state = use_context::<AppState>();
+    let mut reactions_open = use_signal(|| false);
+    let video_settings = state.settings.read().video.clone();
+    let moderator = can_moderate(&state);
     let call = state.call.read();
     let Some(c) = call.as_ref() else { return rsx! {} };
     let name = state.channel_name(c.channel);
     let channel = c.channel;
+    let me = c.identity.clone();
 
     // One screen share or participant can be shown large; the rest go into
     // a strip below (which can be hidden).
     let screens: Vec<VideoFeed> = c.feeds.iter().filter(|f| f.source == TrackSource::Screenshare).cloned().collect();
+    // Your own tile can be left out (when you aren't alone).
+    let participants: Vec<Participant> = c
+        .participants
+        .iter()
+        .filter(|p| !(video_settings.hide_self && p.identity == me && c.participants.len() > 1))
+        .cloned()
+        .collect();
     let focus = c
         .focus
         .clone()
         .filter(|f| match f {
             Focus::Screen(sid) => screens.iter().any(|s| &s.track_sid == sid),
-            Focus::User(id) => c.participants.iter().any(|p| &p.identity == id),
+            Focus::User(id) => participants.iter().any(|p| &p.identity == id),
         })
         // Others' screens come up large by themselves, your own preview doesn't.
         .or_else(|| {
@@ -442,25 +815,67 @@ pub fn CallView(#[props(default)] compact: bool) -> Element {
                 .find(|s| s.participant != c.identity)
                 .filter(|_| c.auto_focus)
                 .map(|s| Focus::Screen(s.track_sid.clone()))
+        })
+        // The speaker layout shows whoever spoke last large.
+        .or_else(|| {
+            if video_settings.call_layout != CallLayout::Speaker || participants.len() < 2 || !c.auto_focus {
+                return None;
+            }
+            c.last_speaker
+                .clone()
+                .filter(|s| participants.iter().any(|p| &p.identity == s))
+                .or_else(|| participants.iter().find(|p| p.identity != me).map(|p| p.identity.clone()))
+                .map(Focus::User)
         });
-    let participants = c.participants.clone();
     let speakers = c.speakers.clone();
     let cameras: Vec<VideoFeed> = c.feeds.iter().filter(|f| f.source == TrackSource::Camera).cloned().collect();
     let strip_hidden = c.strip_hidden;
     let (sharing, camera_on) = (c.sharing, c.camera_on);
+    let hands = c.hands.clone();
+    let hand_up = hands.contains(&me);
+    let reactions = c.reactions.clone();
+    let quality = c.quality.clone();
+    let reconnecting = c.reconnecting;
+    let can_publish = c.can_publish;
+    let (stats_open, stats) = (c.stats_open, c.stats.clone());
+    let my_quality = quality.get(&me).copied();
+
+    // Without a large tile, big calls are split into pages.
+    let (people, pages, page) = if focus.is_none() {
+        let page = c.page.min(participants.len().div_ceil(PAGE_SIZE).max(1) - 1);
+        let (people, pages) = page_of(&participants, page);
+        (people, pages, page)
+    } else {
+        (participants.clone(), 1, 0)
+    };
     // Every tile in one keyed list with the focused one first: a tile that
     // moves between the big spot and the strip is moved, not rebuilt
     // (rebuilding video surfaces made quick focus changes get lost).
     let mut tiles: Vec<StageTile> = screens.iter().cloned().map(StageTile::Screen).collect();
-    tiles.extend(participants.iter().cloned().map(StageTile::Person));
+    tiles.extend(people.iter().cloned().map(StageTile::Person));
     if let Some(i) = tiles.iter().position(|t| Some(t.focus()) == focus) {
         let big = tiles.remove(i);
         tiles.insert(0, big);
     }
+
+    // Receive only the video that is shown, at the size it is shown.
+    let shown: Vec<String> = tiles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| focus.is_none() || *i == 0 || !strip_hidden)
+        .map(|(_, t)| match t {
+            StageTile::Screen(f) => f.track_sid.clone(),
+            StageTile::Person(p) => p.identity.clone(),
+        })
+        .collect();
+    let wanted =
+        wanted_video(&c.feeds, &me, focus.as_ref(), &shown, strip_hidden, video_settings.data_saver, tiles.len());
+    apply_wanted(c, wanted);
     drop(call);
     let muted = *state.muted.read() || *state.deafened.read() || state.in_afk_channel();
     let deafened = *state.deafened.read();
-    let count = participants.len();
+    let count =
+        participants.len() + usize::from(video_settings.hide_self && participants.iter().all(|p| p.identity != me));
 
     rsx! {
         div { class: if compact { "call compact" } else { "call" },
@@ -469,13 +884,47 @@ pub fn CallView(#[props(default)] compact: bool) -> Element {
                 span { class: "topbar-icon", Svg { icon: Icon::Volume, size: 20 } }
                 span { class: "topbar-title", "{name}" }
                 span { class: "e2ee-badge", Svg { icon: Icon::ShieldCheck, size: 14 } {t("call.e2ee")} }
+                if video_settings.data_saver {
+                    span { class: "e2ee-badge", {t("call.data_saver_on")} }
+                }
                 span { class: "topbar-spacer" }
+                if !hands.is_empty() {
+                    span { class: "hand-count", title: t("call.hands"), Svg { icon: Icon::Hand, size: 14 } "{hands.len()}" }
+                }
                 span { class: "muted small", "{count} {t(\"call.in_call\")}" }
+                if moderator {
+                    IconButton { icon: Icon::MicOff, size: 18, title: t("call.mute_all"), onclick: move |_| mute_all(state) }
+                }
+                IconButton {
+                    icon: Icon::LayoutGrid,
+                    size: 18,
+                    title: t("call.layout_toggle"),
+                    onclick: move |_| {
+                        state.update_settings(|s| s.video.call_layout = if s.video.call_layout == CallLayout::Speaker { CallLayout::Grid } else { CallLayout::Speaker });
+                        if let Some(c) = state.call.write().as_mut() {
+                            c.focus = None;
+                            c.auto_focus = true;
+                        }
+                    },
+                }
+                IconButton { icon: Icon::Activity, size: 18, title: t("call.stats"), onclick: move |_| toggle_stats(state) }
                 // Voice channels have a chat of their own.
                 if state.channel_kind(channel) == Some(sivryn_client_core::protocol::model::ChannelKind::Voice) {
                     IconButton { icon: Icon::Message, size: 18, title: t("channels.open_chat"), onclick: move |_| state.voice_chat.toggle() }
                 }
             }
+            }
+            if reconnecting {
+                div { class: "callout warning call-banner", div { class: "spinner small" } span { {t("call.reconnecting")} } }
+            } else if matches!(my_quality, Some(ConnectionQuality::Poor | ConnectionQuality::Lost)) && !video_settings.data_saver {
+                div { class: "callout warning call-banner",
+                    Svg { icon: Icon::Info, size: 16 }
+                    span { {t("call.your_connection_poor")} }
+                    button { class: "button ghost small", onclick: move |_| state.update_settings(|s| s.video.data_saver = true), {t("video.data_saver")} }
+                }
+            }
+            if let Some(stats) = stats.filter(|_| stats_open) {
+                StatsPanel { stats }
             }
             div { class: if focus.is_some() { "stage focus" } else { "stage" },
                 div {
@@ -508,15 +957,24 @@ pub fn CallView(#[props(default)] compact: bool) -> Element {
                                         VideoTile { key: "{feed.track_sid}", feed: feed.clone(), large: big }
                                     }
                                 },
-                                StageTile::Person(p) => rsx! {
-                                    if !(in_strip && strip_hidden) {
-                                        ParticipantTile {
-                                            key: "{p.identity}",
-                                            camera: cameras.iter().find(|f| f.participant == p.identity).cloned(),
-                                            speaking: speakers.contains(&p.identity),
-                                            participant: p,
-                                            large: big,
-                                            strip: in_strip,
+                                StageTile::Person(p) => {
+                                    let own = p.identity == me;
+                                    rsx! {
+                                        if !(in_strip && strip_hidden) {
+                                            ParticipantTile {
+                                                key: "{p.identity}",
+                                                // Data saver: no cameras (your own self view stays).
+                                                camera: cameras.iter().find(|f| f.participant == p.identity).filter(|_| own || !video_settings.data_saver).cloned(),
+                                                speaking: speakers.contains(&p.identity),
+                                                hand: hands.contains(&p.identity),
+                                                quality: quality.get(&p.identity).copied(),
+                                                reactions: reactions.iter().filter(|r| r.identity == p.identity).map(|r| (r.id, r.emoji.clone())).collect::<Vec<_>>(),
+                                                mirror: own && video_settings.mirror_self,
+                                                moderator,
+                                                participant: p,
+                                                large: big,
+                                                strip: in_strip,
+                                            }
                                         }
                                     }
                                 },
@@ -525,9 +983,22 @@ pub fn CallView(#[props(default)] compact: bool) -> Element {
                     }
                 }
             }
+            if pages > 1 {
+                div { class: "pager",
+                    IconButton { icon: Icon::ArrowUp, size: 16, title: t("call.page"), onclick: move |_| {
+                        if let Some(c) = state.call.write().as_mut() { c.page = page.saturating_sub(1); }
+                    } }
+                    span { class: "muted small", "{t(\"call.page\")} {page + 1} / {pages}" }
+                    IconButton { icon: Icon::ArrowDown, size: 16, title: t("call.page"), onclick: move |_| {
+                        if let Some(c) = state.call.write().as_mut() { c.page = (page + 1).min(pages - 1); }
+                    } }
+                }
+            }
             div { class: "controls",
                 if muted {
-                    IconButton { icon: Icon::MicOff, class: "control alert", title: t("call.unmute"), onclick: move |_| state.set_muted(false) }
+                    IconButton { icon: Icon::MicOff, class: "control alert", title: t("call.unmute"), onclick: move |_| {
+                        if can_publish { state.set_muted(false) } else { state.toast(t("call.speak_revoked"), false) }
+                    } }
                 } else {
                     IconButton { icon: Icon::Mic, class: "control", title: t("call.mute"), onclick: move |_| state.set_muted(true) }
                 }
@@ -539,17 +1010,82 @@ pub fn CallView(#[props(default)] compact: bool) -> Element {
                 if camera_on {
                     IconButton { icon: Icon::Video, class: "control on", title: t("call.camera_off"), onclick: move |_| toggle_camera(state) }
                 } else {
-                    IconButton { icon: Icon::VideoOff, class: "control", title: t("call.camera_on"), onclick: move |_| toggle_camera(state) }
+                    IconButton { icon: Icon::VideoOff, class: "control", title: t("call.camera_on"), onclick: move |_| {
+                        if can_publish { toggle_camera(state) } else { state.toast(t("call.speak_revoked"), false) }
+                    } }
                 }
                 if sharing {
                     IconButton { icon: Icon::MonitorOff, class: "control on", title: t("call.stop_share"), onclick: move |_| stop_share(state) }
                 } else {
-                    IconButton { icon: Icon::MonitorUp, class: "control", title: t("call.share"), onclick: move |_| state.modal.set(Some(Modal::PickScreen)) }
+                    IconButton { icon: Icon::MonitorUp, class: "control", title: t("call.share"), onclick: move |_| {
+                        if can_publish { state.modal.set(Some(Modal::PickScreen)) } else { state.toast(t("call.speak_revoked"), false) }
+                    } }
+                }
+                IconButton {
+                    icon: Icon::Hand,
+                    class: if hand_up { "control on" } else { "control" },
+                    title: if hand_up { t("call.lower_hand") } else { t("call.raise_hand") },
+                    onclick: move |_| toggle_hand(state),
+                }
+                div { class: "reaction-control",
+                    IconButton { icon: Icon::Smile, class: "control", title: t("call.react"), onclick: move |_| reactions_open.toggle() }
+                    if *reactions_open.read() {
+                        div { class: "reaction-pop",
+                            for emoji in REACTIONS {
+                                div {
+                                    class: "reaction-choice",
+                                    onclick: move |_| {
+                                        react(state, emoji);
+                                        reactions_open.set(false);
+                                    },
+                                    "{emoji}"
+                                }
+                            }
+                        }
+                    }
                 }
                 IconButton { icon: Icon::PhoneOff, class: "control danger", title: t("call.leave"), onclick: move |_| hang_up(state) }
             }
         }
     }
+}
+
+/// The connection panel: ping, loss, bitrates and codecs.
+#[component]
+fn StatsPanel(stats: sivryn_media::CallStats) -> Element {
+    let rows: Vec<(&'static str, String)> = stats_rows(&stats);
+    rsx! {
+        div { class: "stats-panel",
+            for (label, value) in rows {
+                div { class: "stats-row",
+                    span { class: "muted", {t(label)} }
+                    span { "{value}" }
+                }
+            }
+        }
+    }
+}
+
+/// The connection panel's rows (label key, value), in the units people know:
+/// milliseconds, percent and kbit/s throughout.
+pub fn stats_rows(s: &sivryn_media::CallStats) -> Vec<(&'static str, String)> {
+    let mut rows = vec![
+        ("call.stats_rtt", s.rtt_ms.map(|v| format!("{v:.0} ms")).unwrap_or_else(|| "–".into())),
+        ("call.stats_loss", format!("{:.1} %", s.loss_percent)),
+        ("call.stats_jitter", format!("{:.0} ms", s.jitter_ms)),
+        ("call.stats_send", format!("{:.0} kbit/s", s.send_kbps)),
+        ("call.stats_receive", format!("{:.0} kbit/s", s.receive_kbps)),
+    ];
+    if let Some(v) = s.available_send_kbps {
+        rows.push(("call.stats_available", format!("{v:.0} kbit/s")));
+    }
+    if let Some((w, h, fps)) = s.video_in {
+        rows.push(("call.stats_video", format!("{w}×{h} · {fps:.0} fps")));
+    }
+    if !s.codecs.is_empty() {
+        rows.push(("call.stats_codecs", s.codecs.join(", ")));
+    }
+    rows
 }
 
 /// A tile on the call stage.
@@ -576,6 +1112,17 @@ fn ParticipantTile(
     speaking: bool,
     large: bool,
     #[props(default)] strip: bool,
+    #[props(default)] hand: bool,
+    #[props(default)] quality: Option<ConnectionQuality>,
+    /// Reactions floating over the tile (id, emoji).
+    #[props(default)]
+    reactions: Vec<(u64, String)>,
+    /// Show the camera flipped (your own self view).
+    #[props(default)]
+    mirror: bool,
+    /// You may moderate this call (adds moderation to the menu).
+    #[props(default)]
+    moderator: bool,
 ) -> Element {
     let state = use_context::<AppState>();
     let call_channel = state.call.read().as_ref().map(|c| c.channel);
@@ -592,7 +1139,8 @@ fn ParticipantTile(
         (Some(a), false) => format!("width: auto; aspect-ratio: {a:.4};"),
         _ => String::new(),
     };
-    let (identity, sharing) = (participant.identity.clone(), participant.sharing);
+    let (identity, sharing, muted) = (participant.identity.clone(), participant.sharing, participant.muted);
+    let has_camera = camera.is_some();
     // The name on this server (nickname or display name).
     let name = id
         .map(|id| state.display_name_in(call_channel.and_then(|c| state.guild_of(c)), id))
@@ -607,6 +1155,32 @@ fn ParticipantTile(
                 items.iter().position(|i| matches!(i, super::MenuItem::Check { .. })).unwrap_or(items.len()),
                 super::MenuItem::Volume { label: t("call.stream_volume").into(), key: screen_volume_key(&identity) },
             );
+        }
+        if let Some(channel) = call_channel.filter(|_| moderator && Some(user) != state.me()) {
+            let act = |label: &'static str, icon: Icon, action: ModerateAction| {
+                super::MenuItem::action(t(label), icon, super::menu::MenuAction::ModerateVoice(channel, user, action))
+            };
+            let mut moderation = vec![super::MenuItem::Separator];
+            if muted {
+                moderation.push(super::MenuItem::action(
+                    t("call.mod_ask_unmute"),
+                    Icon::Mic,
+                    super::menu::MenuAction::AskUnmute(identity.clone()),
+                ));
+            } else {
+                moderation.push(act("call.mod_mute", Icon::MicOff, ModerateAction::Mute));
+            }
+            if has_camera {
+                moderation.push(act("call.mod_stop_camera", Icon::VideoOff, ModerateAction::StopCamera));
+            }
+            if sharing {
+                moderation.push(act("call.mod_stop_share", Icon::MonitorOff, ModerateAction::StopShare));
+            }
+            if hand {
+                moderation.push(act("call.mod_allow_speak", Icon::Hand, ModerateAction::AllowSpeak));
+            }
+            moderation.push(act("call.mod_revoke_speak", Icon::Ban, ModerateAction::RevokeSpeak));
+            items.extend(moderation);
         }
         super::menu::open(state, p.x, p.y, items);
     };
@@ -625,7 +1199,7 @@ fn ParticipantTile(
                 }
             },
             match camera {
-                Some(feed) => rsx! { VideoCanvas { key: "{feed.track_sid}", feed } },
+                Some(feed) => rsx! { VideoCanvas { key: "{feed.track_sid}-{mirror}", feed, mirror } },
                 None => rsx! {
                     div { class: "tile-avatar",
                         Avatar { name: name.clone(), id, size: if large { 160 } else if strip { 64 } else { 96 }, speaking }
@@ -641,6 +1215,19 @@ fn ParticipantTile(
                 span { "{name}" }
                 if participant.sharing {
                     span { class: "live-badge", "LIVE" }
+                }
+                if let Some(q) = quality {
+                    QualityBars { quality: q }
+                }
+            }
+            if hand {
+                div { class: "hand-badge", title: t("call.hand_raised"), Svg { icon: Icon::Hand, size: 16 } }
+            }
+            if !reactions.is_empty() {
+                div { class: "reactions",
+                    for (id, emoji) in reactions {
+                        span { key: "{id}", class: "reaction-float", "{emoji}" }
+                    }
                 }
             }
             if let (true, Some(sid)) = (hovered, camera_sid) {
@@ -955,14 +1542,157 @@ fn VideoTile(feed: VideoFeed, large: bool) -> Element {
 }
 
 #[component]
-fn VideoCanvas(feed: VideoFeed, #[props(default)] view: Option<SharedView>) -> Element {
+fn VideoCanvas(feed: VideoFeed, #[props(default)] view: Option<SharedView>, #[props(default)] mirror: bool) -> Element {
     let frames = feed.frames.clone();
     let paint_source = use_wgpu(move || match view {
-        Some(view) => VideoSurface::new(frames).with_view(view),
-        None => VideoSurface::new(frames),
+        Some(view) => VideoSurface::new(frames).with_view(view).mirrored(mirror),
+        None => VideoSurface::new(frames).mirrored(mirror),
     });
     rsx! {
         canvas { class: "video", "src": "{paint_source}" }
+    }
+}
+
+/// Signal-strength bars for someone's connection.
+#[component]
+fn QualityBars(quality: ConnectionQuality) -> Element {
+    let (level, label, class) = match quality {
+        ConnectionQuality::Excellent => (3, "call.quality_excellent", "quality good"),
+        ConnectionQuality::Good => (2, "call.quality_good", "quality good"),
+        ConnectionQuality::Poor => (1, "call.quality_poor", "quality poor"),
+        ConnectionQuality::Lost => (0, "call.quality_lost", "quality lost"),
+    };
+    rsx! {
+        span { class: "{class}", title: t(label),
+            for i in 1..=3 {
+                span { key: "{i}", class: if i <= level { "bar on bar-{i}" } else { "bar bar-{i}" } }
+            }
+        }
+    }
+}
+
+/// Camera and microphone check before joining a call: see yourself, watch
+/// the microphone level, pick camera on or off and the low-light boost.
+#[component]
+pub fn PreJoinDialog(channel: ChannelId) -> Element {
+    let mut state = use_context::<AppState>();
+    let engine = super::use_services_engine();
+    let video = state.settings.read().video.clone();
+    let mut camera_wanted = use_signal(|| true);
+    let mut join_muted = use_signal(|| *state.muted.peek());
+    let preview = use_signal(|| None::<Rc<CameraPreview>>);
+    let mut camera_error = use_signal(|| None::<String>);
+    let mut level = use_signal(|| -90.0f32);
+
+    // The camera runs while the dialog is open and the camera is wanted.
+    use_effect(move || {
+        let wanted = *camera_wanted.read();
+        let mut preview = preview;
+        if !wanted {
+            preview.set(None);
+            return;
+        }
+        if preview.peek().is_some() {
+            return;
+        }
+        let video = state.settings.peek().video.clone();
+        spawn(async move {
+            match CameraPreview::start(video.camera.as_deref(), video.camera_quality, video.low_light).await {
+                Ok(p) => {
+                    camera_error.set(None);
+                    if *camera_wanted.peek() {
+                        preview.set(Some(Rc::new(p)));
+                    }
+                }
+                Err(e) => {
+                    camera_error.set(Some(match e {
+                        sivryn_media::MediaError::NoCamera => t("video.no_camera").to_string(),
+                        sivryn_media::MediaError::NoMediaFoundation => t("video.no_mf").to_string(),
+                        other => other.to_string(),
+                    }));
+                    camera_wanted.set(false);
+                }
+            }
+        });
+    });
+    // The microphone level (captured for the meter only, not played back).
+    let meter_engine = engine.clone();
+    use_hook(move || meter_engine.set_mic_meter(true));
+    let drop_engine = engine.clone();
+    use_drop(move || drop_engine.set_mic_meter(false));
+    let level_engine = engine.clone();
+    use_future(move || {
+        let engine = level_engine.clone();
+        async move {
+            loop {
+                let db = engine.level_db();
+                if (db - *level.peek()).abs() > 1.0 {
+                    level.set(db);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            }
+        }
+    });
+    let percent = ((*level.read() + 60.0) / 60.0 * 100.0).clamp(0.0, 100.0);
+    let name = state.channel_name(channel);
+    let feed = preview.read().as_ref().map(|p| p.preview.clone());
+    let low_light = video.low_light;
+
+    let join = move |_| {
+        let camera = *camera_wanted.peek();
+        let muted = *join_muted.peek();
+        state.modal.set(None);
+        if muted != *state.muted.peek() {
+            state.set_muted(muted);
+        }
+        let mut s = state;
+        s.home.set(false);
+        if let Some(g) = s.guild_of(channel) {
+            s.guild.set(Some(g));
+        }
+        s.channel.set(Some(channel));
+        start(state, channel, camera);
+    };
+    rsx! {
+        div { class: "overlay", onclick: move |_| state.modal.set(None),
+            div { class: "dialog prejoin", onclick: move |e| e.stop_propagation(),
+                div { class: "dialog-header",
+                    h2 { {t("call.preview_title")} }
+                    IconButton { icon: Icon::X, size: 18, onclick: move |_| state.modal.set(None) }
+                }
+                p { class: "muted", "„{name}“" }
+                div { class: "prejoin-video",
+                    match feed {
+                        Some(feed) => rsx! { VideoCanvas { key: "prejoin-{video.mirror_self}", feed, mirror: video.mirror_self } },
+                        None => rsx! {
+                            div { class: "prejoin-off",
+                                Svg { icon: Icon::VideoOff, size: 32 }
+                                span { class: "muted", {camera_error.read().clone().unwrap_or_else(|| t("call.preview_no_camera").to_string())} }
+                            }
+                        },
+                    }
+                }
+                div { class: "prejoin-meter", title: t("call.preview_mic"),
+                    Svg { icon: if *join_muted.read() { Icon::MicOff } else { Icon::Mic }, size: 16 }
+                    div { class: "meter", div { class: "meter-fill", style: "width: {percent:.0}%;" } }
+                }
+                div { class: "prejoin-toggles",
+                    Toggle { on: *camera_wanted.read(), onchange: move |v: bool| camera_wanted.set(v) }
+                    span { {t("call.preview_camera")} }
+                    Toggle { on: !*join_muted.read(), onchange: move |v: bool| join_muted.set(!v) }
+                    span { {t("call.preview_mic")} }
+                    Toggle { on: low_light, onchange: move |v: bool| {
+                        set_low_light(state, v);
+                        if let Some(p) = preview.peek().as_ref() { p.set_low_light(v); }
+                    } }
+                    span { {t("video.low_light")} }
+                }
+                div { class: "dialog-actions",
+                    button { class: "button ghost", onclick: move |_| state.modal.set(None), {t("common.cancel")} }
+                    button { class: "button primary", autofocus: "true", onclick: join, {t("call.preview_join")} }
+                }
+            }
+        }
     }
 }
 
@@ -1346,5 +2076,116 @@ mod tests {
         // At 2× the shown half can't move past the edges.
         let view = View { zoom: 2.0, centre: (0.95, 0.1) };
         assert_eq!(view.bounds(), ((0.5, 0.0), (1.0, 0.5)));
+    }
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    fn feed(participant: &str, source: TrackSource, sid: &str) -> VideoFeed {
+        let (_tx, frames) = tokio::sync::watch::channel(None);
+        VideoFeed { participant: participant.into(), source, track_sid: sid.into(), frames }
+    }
+
+    fn quality_of(wanted: &[(String, Option<VideoQuality>)], sid: &str) -> Option<VideoQuality> {
+        wanted.iter().find(|(s, _)| s == sid).and_then(|(_, q)| *q)
+    }
+
+    #[test]
+    fn grid_quality_follows_size() {
+        let feeds = vec![
+            feed("me", TrackSource::Camera, "mine"),
+            feed("a", TrackSource::Camera, "cam-a"),
+            feed("b", TrackSource::Camera, "cam-b"),
+        ];
+        let shown = vec!["me".to_string(), "a".to_string(), "b".to_string()];
+        let w = wanted_video(&feeds, "me", None, &shown, false, false, 2);
+        // Your own camera is never subscribed.
+        assert!(w.iter().all(|(s, _)| s != "mine"));
+        assert_eq!(quality_of(&w, "cam-a"), Some(VideoQuality::High));
+        let w = wanted_video(&feeds, "me", None, &shown, false, false, 5);
+        assert_eq!(quality_of(&w, "cam-a"), Some(VideoQuality::Medium));
+        let w = wanted_video(&feeds, "me", None, &shown, false, false, 12);
+        assert_eq!(quality_of(&w, "cam-b"), Some(VideoQuality::Low));
+    }
+
+    #[test]
+    fn hidden_tiles_and_data_saver_pause_cameras() {
+        let feeds = vec![
+            feed("a", TrackSource::Camera, "cam-a"),
+            feed("b", TrackSource::Camera, "cam-b"),
+            feed("c", TrackSource::Screenshare, "screen-c"),
+        ];
+        // b is on another page.
+        let w = wanted_video(&feeds, "me", None, &["a".into(), "screen-c".into()], false, false, 2);
+        assert_eq!(quality_of(&w, "cam-b"), None);
+        assert_eq!(quality_of(&w, "screen-c"), Some(VideoQuality::High));
+
+        // Focus on the screen with the strip hidden: cameras pause.
+        let focus = Focus::Screen("screen-c".into());
+        let shown = vec!["screen-c".to_string()];
+        let w = wanted_video(&feeds, "me", Some(&focus), &shown, true, false, 3);
+        assert_eq!(quality_of(&w, "cam-a"), None);
+        assert_eq!(quality_of(&w, "screen-c"), Some(VideoQuality::High));
+
+        // Strip shown: cameras small.
+        let shown = vec!["screen-c".to_string(), "a".into(), "b".into()];
+        let w = wanted_video(&feeds, "me", Some(&focus), &shown, false, false, 3);
+        assert_eq!(quality_of(&w, "cam-a"), Some(VideoQuality::Low));
+
+        // Data saver: no cameras, screens low.
+        let w = wanted_video(&feeds, "me", None, &shown, false, true, 3);
+        assert_eq!(quality_of(&w, "cam-a"), None);
+        assert_eq!(quality_of(&w, "screen-c"), Some(VideoQuality::Low));
+    }
+
+    #[test]
+    fn focused_camera_is_full_size() {
+        let feeds = vec![feed("a", TrackSource::Camera, "cam-a"), feed("b", TrackSource::Camera, "cam-b")];
+        let focus = Focus::User("a".into());
+        let shown = vec!["a".to_string(), "b".to_string()];
+        let w = wanted_video(&feeds, "me", Some(&focus), &shown, false, false, 2);
+        assert_eq!(quality_of(&w, "cam-a"), Some(VideoQuality::High));
+        assert_eq!(quality_of(&w, "cam-b"), Some(VideoQuality::Low));
+    }
+
+    #[test]
+    fn pages() {
+        let people: Vec<u32> = (0..40).collect();
+        let (first, pages) = page_of(&people, 0);
+        assert_eq!((first.len(), pages), (PAGE_SIZE, 3));
+        let (last, _) = page_of(&people, 2);
+        assert_eq!(last, (32..40).collect::<Vec<_>>());
+        // A page past the end shows the last one.
+        assert_eq!(page_of(&people, 9).0, last);
+        assert_eq!(page_of::<u32>(&[], 0), (Vec::new(), 1));
+    }
+
+    #[test]
+    fn stats_rows_use_consistent_units() {
+        let stats = sivryn_media::CallStats {
+            rtt_ms: Some(41.6),
+            loss_percent: 2.25,
+            send_kbps: 1200.4,
+            receive_kbps: 3400.0,
+            available_send_kbps: Some(5000.0),
+            codecs: vec!["audio/opus".into(), "video/AV1".into()],
+            video_in: Some((1920, 1080, 30.0)),
+            jitter_ms: 3.0,
+        };
+        let rows = stats_rows(&stats);
+        let get = |k: &str| rows.iter().find(|(l, _)| *l == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("call.stats_rtt"), "42 ms");
+        assert_eq!(get("call.stats_loss"), "2.2 %");
+        assert_eq!(get("call.stats_send"), "1200 kbit/s");
+        assert_eq!(get("call.stats_receive"), "3400 kbit/s");
+        assert_eq!(get("call.stats_available"), "5000 kbit/s");
+        assert_eq!(get("call.stats_video"), "1920×1080 · 30 fps");
+        assert_eq!(get("call.stats_codecs"), "audio/opus, video/AV1");
+        // Every label has a translation.
+        for (label, _) in rows {
+            assert_ne!(crate::i18n::t(label), label);
+        }
     }
 }

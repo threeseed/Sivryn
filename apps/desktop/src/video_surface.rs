@@ -130,6 +130,8 @@ pub struct VideoSurface {
     logged_first_render: bool,
     /// Fill the canvas and crop the overflow instead of letterboxing.
     cover: bool,
+    /// Flip left and right (your own camera, like a mirror).
+    mirror: bool,
     /// Asks the window to repaint whenever a new frame arrives.
     repaint: tokio::task::JoinHandle<()>,
 }
@@ -151,6 +153,7 @@ impl VideoSurface {
             gpu: None,
             logged_first_render: false,
             cover: false,
+            mirror: false,
             repaint,
         }
     }
@@ -165,6 +168,12 @@ impl VideoSurface {
     /// the layout must not leave thin bars at the edges).
     pub fn cover(mut self) -> Self {
         self.cover = true;
+        self
+    }
+
+    /// Shows the frame flipped left to right (the self view).
+    pub fn mirrored(mut self, mirror: bool) -> Self {
+        self.mirror = mirror;
         self
     }
 }
@@ -328,7 +337,7 @@ impl Gpu {
         self.dirty = true;
     }
 
-    fn draw(&mut self, cover: bool, view: View) {
+    fn draw(&mut self, cover: bool, mirror: bool, view: View) {
         let (Some((frame, bind_group)), Some(output)) = (&self.frame, &self.output) else { return };
 
         // Letterbox: fit the frame into the canvas, keeping its aspect ratio
@@ -346,7 +355,10 @@ impl Gpu {
         } else {
             (frame_aspect / canvas_aspect, 1.0)
         };
-        let ((u0, v0), (u1, v1)) = view.bounds();
+        let ((mut u0, v0), (mut u1, v1)) = view.bounds();
+        if mirror {
+            std::mem::swap(&mut u0, &mut u1);
+        }
         let rect: [f32; 8] = [-sx, sy, sx, -sy, u0, v0, u1, v1];
         let bytes: Vec<u8> = rect.iter().flat_map(|v| v.to_ne_bytes()).collect();
         self.queue.write_buffer(&self.rect, 0, &bytes);
@@ -444,7 +456,7 @@ impl CustomPaintSource for VideoSurface {
             gpu.dirty = true;
         }
         if gpu.dirty {
-            gpu.draw(self.cover, view);
+            gpu.draw(self.cover, self.mirror, view);
         }
         gpu.output.as_ref().map(|o| o.handle.clone())
     }

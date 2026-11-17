@@ -408,6 +408,43 @@ async fn voice_join_issues_scoped_livekit_token() {
     app.cleanup().await;
 }
 
+#[tokio::test]
+async fn call_moderation_needs_mute_members() {
+    let Some(app) = TestApp::spawn(RegistrationMode::Open).await else { return };
+    let alice = app.register("alice").await;
+    let bob = app.register("bob").await;
+    let mallory = app.register("mallory").await;
+    let guild = create_guild(&app, &alice, "g").await;
+    join_guild(&app, &alice, &bob, &guild).await;
+    let voice = voice_channel(&guild);
+    let target = alice.user.id;
+    let mute = json!({ "action": "mute" });
+
+    // Members without MUTE_MEMBERS and outsiders can't moderate.
+    let path = format!("/channels/{voice}/voice/{target}/moderate");
+    assert_eq!(app.post(&path, &bob.token, mute.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(app.post(&path, &mallory.token, mute.clone()).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        app.post(&format!("/channels/{voice}/voice/mute-all"), &bob.token, json!(null)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // Text channels have no calls.
+    let text = text_channel(&guild);
+    assert_eq!(
+        app.post(&format!("/channels/{text}/voice/{target}/moderate"), &alice.token, mute.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // Unknown actions are rejected before anything else happens.
+    let bad = app.post(&path, &alice.token, json!({ "action": "explode" })).await.0;
+    assert!(bad.is_client_error(), "{bad}");
+    // The owner passes the permission check; without LiveKit the call itself fails.
+    let (status, _) = app.post(&path, &alice.token, mute).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_ne!(status, StatusCode::NO_CONTENT);
+
+    app.cleanup().await;
+}
+
 /// Full path: real MLS key packages through the delivery service, a welcome,
 /// and an encrypted message that arrives over the gateway and decrypts.
 #[tokio::test]

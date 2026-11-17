@@ -72,6 +72,10 @@ pub enum Icon {
     ArrowDown,
     VolumeX,
     Shield,
+    Hand,
+    Activity,
+    LayoutGrid,
+    Sun,
 }
 
 /// Shapes in a 24×24 box, stroked with width 2 and round caps/joins.
@@ -268,6 +272,25 @@ fn shapes(icon: Icon) -> &'static [Shape] {
         Icon::Shield => &[Path(
             "M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z",
         )],
+        Icon::Hand => &[
+            Path("M18 11V6a2 2 0 0 0-4 0v5"),
+            Path("M14 10V4a2 2 0 0 0-4 0v2"),
+            Path("M10 10.5V6a2 2 0 0 0-4 0v8"),
+            Path("M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"),
+        ],
+        Icon::Activity => &[Path("M22 12h-4l-3 9L9 3l-3 9H2")],
+        Icon::LayoutGrid => &[
+            Rect(3.0, 3.0, 7.0, 7.0, 1.0),
+            Rect(14.0, 3.0, 7.0, 7.0, 1.0),
+            Rect(14.0, 14.0, 7.0, 7.0, 1.0),
+            Rect(3.0, 14.0, 7.0, 7.0, 1.0),
+        ],
+        Icon::Sun => &[
+            Circle(12.0, 12.0, 4.0),
+            Path(
+                "M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41",
+            ),
+        ],
         Icon::Users => &[
             Path("M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"),
             Circle(9.0, 7.0, 4.0),

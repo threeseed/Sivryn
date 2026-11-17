@@ -34,6 +34,10 @@ pub enum MenuAction {
     Kick(GuildId, UserId),
     Ban(GuildId, UserId),
     Disconnect(ChannelId, UserId),
+    /// A moderator action on someone in a call.
+    ModerateVoice(ChannelId, UserId, sivryn_client_core::protocol::call::ModerateAction),
+    /// Ask someone in the call to unmute (by identity).
+    AskUnmute(String),
     ToggleLocalMute(String),
     GuildSettings(GuildId),
     Invite(GuildId),
@@ -505,6 +509,8 @@ pub fn run(mut state: AppState, action: MenuAction) {
         MenuAction::Disconnect(channel, user) => {
             bg(async move { done(s.api.disconnect_voice(channel, user).await.map_err(|e| e.to_string())) })
         }
+        MenuAction::ModerateVoice(channel, user, action) => super::call::moderate(state, channel, user, action),
+        MenuAction::AskUnmute(identity) => super::call::ask_unmute(state, identity),
         MenuAction::ToggleLocalMute(key) => state.update_settings(|st| {
             if !st.muted_users.remove(&key) {
                 st.muted_users.insert(key);

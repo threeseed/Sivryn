@@ -5,6 +5,7 @@
 //! does not travel through these types; it flows through the LiveKit SFU.
 
 pub mod api;
+pub mod call;
 pub mod gateway;
 pub mod ids;
 pub mod media;
